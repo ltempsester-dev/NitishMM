@@ -107,7 +107,7 @@ bot.on("message:text", async (ctx) => {
     }
     
     await bot.api.sendMessage(groupId, TEMPLATE);
-    await bot.api.sendMessage(groupId, `🔗 Invite Link: ${link}`);
+    await bot.api.sendMessage(groupId, `Please only share this invite link with anyone involved in this deal.\n${link}`);
     await ctx.reply("✅ Template sent!\n\nNow send the wallet address when users provide deal details.");
     currentStep = 'awaiting_address';
     return;
