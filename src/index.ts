@@ -16,6 +16,19 @@ bot.use(session({ initial: (): SessionData => ({ step: 'idle' }) }));
 const ADMINS = process.env.ADMIN_IDS?.split(',').map(Number) || [];
 const FEE = 3; // 3%
 
+// Telegram's Bot API has no way to fetch past chat history (that's only
+// possible with a user/MTProto client). So we track recent group messages
+// ourselves as they arrive, and read from this cache instead.
+const recentGroupMessages = new Map<number, string[]>();
+const MAX_HISTORY_PER_GROUP = 10;
+
+function recordGroupMessage(chatId: number, text: string) {
+  const list = recentGroupMessages.get(chatId) || [];
+  list.unshift(text); // newest first
+  if (list.length > MAX_HISTORY_PER_GROUP) list.length = MAX_HISTORY_PER_GROUP;
+  recentGroupMessages.set(chatId, list);
+}
+
 const TEMPLATE = `Hi, To proceed, please provide:
 - Buyer's username
 - Brief deal description
@@ -64,6 +77,16 @@ bot.callbackQuery("reject", async (ctx) => {
   ctx.session.step = 'idle';
 });
 
+// ============ TRACK GROUP MESSAGES ============
+// Runs for every text message so we build up a local history for each group,
+// since Telegram won't let us fetch it after the fact.
+bot.on("message:text", async (ctx, next) => {
+  if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+    recordGroupMessage(ctx.chat.id, ctx.message.text);
+  }
+  await next();
+});
+
 // ============ HANDLE DMs ============
 bot.on("message:text", async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) return;
@@ -93,20 +116,18 @@ bot.on("message:text", async (ctx) => {
       return ctx.reply("❌ No group found.");
     }
     
-    // Extract amount from group
+    // Extract amount from our locally tracked group history
+    // (Telegram's Bot API can't fetch past messages, so we rely on the
+    // cache built by the tracker above.)
     let amount = 0;
-    try {
-      const msgs = await bot.api.getChatHistory(groupId, { limit: 10 });
-      for (const msg of msgs.messages) {
-        if (msg.text) {
-          const match = msg.text.match(/\$?(\d+\.?\d*)/);
-          if (match) {
-            amount = parseFloat(match[1]);
-            break;
-          }
-        }
+    const msgs = recentGroupMessages.get(groupId) || [];
+    for (const text of msgs) {
+      const match = text.match(/\$?(\d+\.?\d*)/);
+      if (match) {
+        amount = parseFloat(match[1]);
+        break;
       }
-    } catch(e) {}
+    }
     
     const fee = amount * (FEE / 100);
     const total = amount + fee;
