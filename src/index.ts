@@ -333,10 +333,10 @@ async function finalizeDeal(
   const total = amount + fee;
 
   await bot.api.sendMessage(groupId,
-    `💰 *Wallet Address (${network}):*\n\`${address}\`\n\n` +
-    `💵 Amount: $${amount}\n` +
-    `📊 Fee (${FEE}%): $${fee.toFixed(2)}\n` +
-    `🔢 Total: $${total.toFixed(2)}`,
+    ` *Wallet Address (${network}):*\n\`${address}\`\n\n` +
+    ` Amount: $${amount}\n` +
+    ` Fee (${FEE}%): $${fee.toFixed(2)}\n` +
+    ` Total: $${total.toFixed(2)}`,
     { parse_mode: "Markdown" }
   );
 
