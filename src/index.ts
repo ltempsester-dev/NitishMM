@@ -133,10 +133,22 @@ const TEMPLATE = `Hi, To proceed, please provide:
 
 Once everything is provided, please tag me and I'll be available.`;
 
+// ============ BOT ADDED TO GROUP ============
 bot.on("my_chat_member", async (ctx) => {
   const update = ctx.update.my_chat_member;
+  const oldStatus = update.old_chat_member.status;
   const newStatus = update.new_chat_member.status;
-  if (newStatus === "member" || newStatus === "administrator") {
+
+  // The bot can't actually do anything in a group without admin rights
+  // (posting on schedule, managing messages, etc.), so we wait for the
+  // bot to become an admin before sending the Accept/Reject prompt —
+  // whether it was added directly as admin, or added as a plain member
+  // and promoted afterward. We also require oldStatus wasn't already
+  // "administrator", so this only fires once per promotion (not on
+  // every unrelated my_chat_member event Telegram might send).
+  const justBecameAdmin = newStatus === "administrator" && oldStatus !== "administrator";
+
+  if (justBecameAdmin) {
     const groupId = update.chat.id;
     const groupTitle = ('title' in update.chat && update.chat.title) || 'this group';
     await upsertDeal(groupId, groupTitle, 'pending_accept');
