@@ -26,6 +26,7 @@ let currentStep: 'idle' | 'awaiting_link' | 'awaiting_network' = 'idle';
 const WALLETS: Record<string, string | undefined> = {
   BEP20: process.env.BEP20_ADDRESS,
   TRC20: process.env.TRC20_ADDRESS,
+  ERC20: process.env.TRC20_ADDRESS,
 };
 
 // Telegram's Bot API has no way to fetch past chat history (that's only
