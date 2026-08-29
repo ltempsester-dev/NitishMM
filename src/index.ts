@@ -186,6 +186,20 @@ bot.callbackQuery("notpaid", async (ctx) => {
     await bot.api.sendMessage(groupId, "⏳ Payment not received yet. Please wait.");
   }
   await ctx.editMessageText("⏳ Waiting for payment...");
+
+  // Re-send the confirmation prompt so the admin can check again later
+  // instead of the flow dead-ending with no button to tap.
+  for (const adminId of ADMINS) {
+    await bot.api.sendMessage(adminId,
+      "🔔 *Payment Status*\n\nHas the payment been received?",
+      {
+        parse_mode: "Markdown",
+        reply_markup: new InlineKeyboard()
+          .text("✅ Received", "paid")
+          .text("❌ Not Yet", "notpaid")
+      }
+    );
+  }
 });
 
 // ============ FAKE HTTP SERVER (Render free tier needs an open port) ============
