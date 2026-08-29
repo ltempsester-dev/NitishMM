@@ -1,6 +1,7 @@
 import { Bot, InlineKeyboard, Context } from "grammy";
 import { config } from "dotenv";
 import http from "http";
+import { Pool } from "pg";
 config();
 
 type MyContext = Context;
@@ -10,14 +11,72 @@ const bot = new Bot<MyContext>(process.env.BOT_TOKEN!);
 const ADMINS = process.env.ADMIN_IDS?.split(',').map(Number) || [];
 const FEE = 3; // 3%
 
-// Deal state, shared across chats (group + admin DM).
-// NOTE: grammy's session plugin keys data per-chat, but this bot needs to
-// read/write groupId and step across two different chats (the group, and
-// the admin's private DM) — so we use plain shared variables instead of
-// ctx.session, which would otherwise silently desync between chats.
-// This also means only one deal can be "in progress" at a time.
-let currentGroupId: number | undefined;
-let currentStep: 'idle' | 'awaiting_link' | 'awaiting_network' = 'idle';
+// ============ DATABASE (Neon Postgres) ============
+// Everything the bot needs to "remember" — deal state and recent group
+// messages — is stored here instead of plain in-memory variables. This
+// means a Render redeploy/restart no longer wipes an in-progress deal
+// or the message cache used for amount detection.
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // required by Neon
+});
+
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bot_state (
+      id INT PRIMARY KEY DEFAULT 1,
+      group_id BIGINT,
+      step TEXT NOT NULL DEFAULT 'idle',
+      CHECK (id = 1)
+    );
+  `);
+  await pool.query(`
+    INSERT INTO bot_state (id, group_id, step)
+    VALUES (1, NULL, 'idle')
+    ON CONFLICT (id) DO NOTHING;
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS group_messages (
+      id SERIAL PRIMARY KEY,
+      chat_id BIGINT NOT NULL,
+      text TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_group_messages_chat_id
+    ON group_messages (chat_id, created_at DESC);
+  `);
+}
+
+type Step = 'idle' | 'awaiting_link' | 'awaiting_network';
+
+async function getState(): Promise<{ groupId: number | null; step: Step }> {
+  const { rows } = await pool.query('SELECT group_id, step FROM bot_state WHERE id = 1');
+  const row = rows[0];
+  return { groupId: row?.group_id ?? null, step: (row?.step as Step) ?? 'idle' };
+}
+
+async function setState(fields: { groupId?: number | null; step?: Step }) {
+  const current = await getState();
+  const groupId = fields.groupId !== undefined ? fields.groupId : current.groupId;
+  const step = fields.step !== undefined ? fields.step : current.step;
+  await pool.query('UPDATE bot_state SET group_id = $1, step = $2 WHERE id = 1', [groupId, step]);
+}
+
+const MAX_HISTORY_PER_GROUP = 10;
+
+async function recordGroupMessage(chatId: number, text: string) {
+  await pool.query('INSERT INTO group_messages (chat_id, text) VALUES ($1, $2)', [chatId, text]);
+}
+
+async function getRecentGroupMessages(chatId: number): Promise<string[]> {
+  const { rows } = await pool.query(
+    'SELECT text FROM group_messages WHERE chat_id = $1 ORDER BY created_at DESC LIMIT $2',
+    [chatId, MAX_HISTORY_PER_GROUP]
+  );
+  return rows.map(r => r.text);
+}
 
 // Pre-configured wallet addresses per network, set via environment
 // variables so real addresses are never hardcoded in the code or
@@ -26,21 +85,8 @@ let currentStep: 'idle' | 'awaiting_link' | 'awaiting_network' = 'idle';
 const WALLETS: Record<string, string | undefined> = {
   BEP20: process.env.BEP20_ADDRESS,
   TRC20: process.env.TRC20_ADDRESS,
-  ERC20: process.env.TRC20_ADDRESS,
+  ERC20: process.env.ERC20_ADDRESS,
 };
-
-// Telegram's Bot API has no way to fetch past chat history (that's only
-// possible with a user/MTProto client). So we track recent group messages
-// ourselves as they arrive, and read from this cache instead.
-const recentGroupMessages = new Map<number, string[]>();
-const MAX_HISTORY_PER_GROUP = 10;
-
-function recordGroupMessage(chatId: number, text: string) {
-  const list = recentGroupMessages.get(chatId) || [];
-  list.unshift(text); // newest first
-  if (list.length > MAX_HISTORY_PER_GROUP) list.length = MAX_HISTORY_PER_GROUP;
-  recentGroupMessages.set(chatId, list);
-}
 
 // Extracts the deal amount from recent group messages using a strict,
 // three-tier strategy instead of grabbing the first digit found (which
@@ -91,15 +137,15 @@ bot.on("my_chat_member", async (ctx) => {
   // Telegram reports "member" if added normally, or "administrator" if
   // added with admin rights — handle both, since either can happen.
   if (newStatus === "member" || newStatus === "administrator") {
-    currentGroupId = update.chat.id;
-    
+    await setState({ groupId: update.chat.id });
+
     for (const adminId of ADMINS) {
-      await bot.api.sendMessage(adminId, 
+      await bot.api.sendMessage(adminId,
         `🔔 Bot added to ${update.chat.title}\n\nAccept?`,
-        { 
+        {
           reply_markup: new InlineKeyboard()
             .text("✅ Accept", "accept")
-            .text("❌ Reject", "reject") 
+            .text("❌ Reject", "reject")
         }
       );
     }
@@ -113,7 +159,7 @@ bot.callbackQuery("accept", async (ctx) => {
   }
   await ctx.answerCallbackQuery("✅");
   await ctx.editMessageText("✅ Send the invite link now:");
-  currentStep = 'awaiting_link';
+  await setState({ step: 'awaiting_link' });
 });
 
 bot.callbackQuery("reject", async (ctx) => {
@@ -122,7 +168,7 @@ bot.callbackQuery("reject", async (ctx) => {
   }
   await ctx.answerCallbackQuery("❌");
   await ctx.editMessageText("❌ Rejected");
-  currentStep = 'idle';
+  await setState({ step: 'idle' });
 });
 
 // ============ TRACK GROUP MESSAGES ============
@@ -130,7 +176,7 @@ bot.callbackQuery("reject", async (ctx) => {
 // since Telegram won't let us fetch it after the fact.
 bot.on("message:text", async (ctx, next) => {
   if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
-    recordGroupMessage(ctx.chat.id, ctx.message.text);
+    await recordGroupMessage(ctx.chat.id, ctx.message.text);
   }
   await next();
 });
@@ -139,15 +185,16 @@ bot.on("message:text", async (ctx, next) => {
 bot.on("message:text", async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) return;
 
+  const { step, groupId } = await getState();
+
   // Waiting for invite link
-  if (currentStep === 'awaiting_link') {
+  if (step === 'awaiting_link') {
     const link = ctx.message.text;
-    const groupId = currentGroupId;
-    
+
     if (!groupId) {
       return ctx.reply("❌ No group found. Add bot to group first.");
     }
-    
+
     await bot.api.sendMessage(groupId, TEMPLATE);
     await bot.api.sendMessage(groupId, `Please only share this invite link with anyone involved in this deal.\n${link}`);
 
@@ -159,7 +206,7 @@ bot.on("message:text", async (ctx) => {
       "✅ Template sent!\n\nOnce the buyer provides deal details, tap the network to send the wallet address:",
       { reply_markup: networkButtons }
     );
-    currentStep = 'awaiting_network';
+    await setState({ step: 'awaiting_network' });
     return;
   }
 });
@@ -169,13 +216,13 @@ bot.callbackQuery(/^network:(.+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
     return ctx.answerCallbackQuery("⛔ Not authorized!");
   }
-  if (currentStep !== 'awaiting_network') {
+  const { step, groupId } = await getState();
+  if (step !== 'awaiting_network') {
     return ctx.answerCallbackQuery("⚠️ Not expecting a network selection right now.");
   }
 
   const network = ctx.match[1];
   const address = WALLETS[network];
-  const groupId = currentGroupId;
 
   if (!groupId) {
     await ctx.answerCallbackQuery("❌ No group found.");
@@ -191,25 +238,21 @@ bot.callbackQuery(/^network:(.+)$/, async (ctx) => {
 
   await ctx.answerCallbackQuery(`✅ ${network}`);
 
-  // Extract amount from our locally tracked group history using the
+  // Extract amount from our persisted group message history using the
   // strict label-based matcher (see extractAmount above).
-  const msgs = recentGroupMessages.get(groupId) || [];
+  const msgs = await getRecentGroupMessages(groupId);
   const { amount, source } = extractAmount(msgs);
 
   if (amount === 0) {
-    // Diagnostic dump: show exactly what the bot has cached for this
+    // Diagnostic dump: show exactly what the bot has recorded for this
     // group, so a $0 result is immediately explainable instead of a
-    // mystery. If this list is empty, the group's messages never made
-    // it into the cache at all (e.g. sent before the bot joined, a
-    // restart wiped the in-memory cache, or a stray duplicate instance
-    // absorbed the update) — a completely different problem than the
-    // regex not matching.
+    // mystery.
     const cacheDump = msgs.length
       ? msgs.map((m, i) => `${i + 1}. "${m.replace(/\n/g, ' / ')}"`).join('\n')
-      : '(empty — no group messages cached at all)';
+      : '(empty — no group messages recorded at all)';
     await ctx.reply(
       "⚠️ Couldn't find an amount in the recent group messages — sending with $0.\n\n" +
-      "Here's exactly what I have cached for this group:\n" + cacheDump
+      "Here's exactly what I have recorded for this group:\n" + cacheDump
     );
   } else {
     // Let the admin see exactly what text the amount was pulled from,
@@ -239,7 +282,7 @@ bot.callbackQuery(/^network:(.+)$/, async (ctx) => {
     }
   );
 
-  currentStep = 'idle';
+  await setState({ step: 'idle' });
 });
 
 // ============ PAYMENT CONFIRMATION ============
@@ -248,10 +291,10 @@ bot.callbackQuery("paid", async (ctx) => {
     return ctx.answerCallbackQuery("⛔ Not authorized!");
   }
   await ctx.answerCallbackQuery("✅ Payment confirmed!");
-  
-  const groupId = currentGroupId;
+
+  const { groupId } = await getState();
   if (groupId) {
-    await bot.api.sendMessage(groupId, "✅ Received & confirmed, please start 🎉");
+    await bot.api.sendMessage(groupId, "received");
   }
   await ctx.editMessageText("✅ Payment confirmed! Message sent to group.");
 });
@@ -261,8 +304,8 @@ bot.callbackQuery("notpaid", async (ctx) => {
     return ctx.answerCallbackQuery("⛔ Not authorized!");
   }
   await ctx.answerCallbackQuery("⏳");
-  
-  const groupId = currentGroupId;
+
+  const { groupId } = await getState();
   if (groupId) {
     await bot.api.sendMessage(groupId, "⏳ Payment not received yet. Please wait.");
   }
@@ -296,6 +339,13 @@ http.createServer((_req, res) => {
 });
 
 // ============ START ============
-bot.start();
-console.log("🚀 Middleman Bot is running!");
-console.log(`👤 Admins: ${ADMINS.join(', ')}`);
+initDb()
+  .then(() => {
+    bot.start();
+    console.log("🚀 Middleman Bot is running!");
+    console.log(`👤 Admins: ${ADMINS.join(', ')}`);
+  })
+  .catch((err) => {
+    console.error("❌ Failed to initialize database:", err);
+    process.exit(1);
+  });
