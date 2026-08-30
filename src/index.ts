@@ -8,6 +8,20 @@ type MyContext = Context;
 
 const bot = new Bot<MyContext>(process.env.BOT_TOKEN!);
 
+// Telegram callback queries expire (roughly a few minutes) — tapping an
+// old button after that throws "query is too old / query ID is invalid".
+// Without this wrapper, that single failure would go unhandled and crash
+// the whole process (see bot.catch below for the same reasoning). We
+// swallow it here instead, since there's nothing useful to do about an
+// expired tap other than log it.
+async function safeAnswer(ctx: MyContext, text?: string) {
+  try {
+    await ctx.answerCallbackQuery(text);
+  } catch (err) {
+    console.error("⚠️ answerCallbackQuery failed (likely an expired button tap):", err);
+  }
+}
+
 const ADMINS = process.env.ADMIN_IDS?.split(',').map(Number) || [];
 const FEE = 3; // 3%
 
@@ -249,15 +263,15 @@ bot.on("my_chat_member", async (ctx) => {
 
 bot.callbackQuery(/^accept:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const groupId = Number(ctx.match[1]);
   const deal = await getDeal(groupId);
   if (!deal) {
-    return ctx.answerCallbackQuery("❌ Deal not found (may have expired).");
+    return safeAnswer(ctx, "❌ Deal not found (may have expired).");
   }
 
-  await ctx.answerCallbackQuery("✅");
+  await safeAnswer(ctx, "✅");
   await ctx.editMessageText(`✅ Accepted: ${deal.groupTitle}`);
 
   const promptMsg = await bot.api.sendMessage(
@@ -272,10 +286,10 @@ bot.callbackQuery(/^accept:(-?\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^reject:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const groupId = Number(ctx.match[1]);
-  await ctx.answerCallbackQuery("❌");
+  await safeAnswer(ctx, "❌");
   await ctx.editMessageText("❌ Rejected");
   await setDealStep(groupId, 'rejected');
 });
@@ -333,10 +347,10 @@ async function finalizeDeal(
   const total = amount + fee;
 
   await bot.api.sendMessage(groupId,
-    `💰 *Wallet Address (${network}):*\n\`${address}\`\n\n` +
-    `💵 Amount: $${amount}\n` +
-    `📊 Fee (${FEE}%): $${fee.toFixed(2)}\n` +
-    `🔢 Total: $${total.toFixed(2)}`,
+    `*Wallet Address (${network}):*\n\`${address}\`\n\n` +
+    `Amount: $${amount}\n` +
+    `Fee (${FEE}%): $${fee.toFixed(2)}\n` +
+    `Total: $${total.toFixed(2)}`,
     { parse_mode: "Markdown" }
   );
 
@@ -355,22 +369,22 @@ async function finalizeDeal(
 
 bot.callbackQuery(/^network:([A-Za-z0-9]+):(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const network = ctx.match[1];
   const groupId = Number(ctx.match[2]);
 
   const deal = await getDeal(groupId);
   if (!deal || deal.step !== 'awaiting_network') {
-    return ctx.answerCallbackQuery("⚠️ This deal isn't awaiting a network selection right now.");
+    return safeAnswer(ctx, "⚠️ This deal isn't awaiting a network selection right now.");
   }
   if (!WALLETS[network]) {
-    await ctx.answerCallbackQuery(`⚠️ No ${network} address configured!`);
+    await safeAnswer(ctx, `⚠️ No ${network} address configured!`);
     await ctx.reply(`⚠️ ${network}_ADDRESS isn't set in the bot's environment variables. Add it in Render → Environment, then redeploy.`);
     return;
   }
 
-  await ctx.answerCallbackQuery(`✅ ${network}`);
+  await safeAnswer(ctx, `✅ ${network}`);
 
   const msgs = await getRecentGroupMessages(groupId);
   const forms = msgs.map(parseForm).filter((f): f is ParsedForm => f !== null);
@@ -417,22 +431,22 @@ bot.callbackQuery(/^network:([A-Za-z0-9]+):(-?\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^form:(\d+):(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const formIndex = Number(ctx.match[1]);
   const groupId = Number(ctx.match[2]);
 
   const deal = await getDeal(groupId);
   if (!deal || deal.step !== 'awaiting_form_selection' || !deal.pendingForms || !deal.selectedNetwork) {
-    return ctx.answerCallbackQuery("⚠️ Not expecting a form selection right now.");
+    return safeAnswer(ctx, "⚠️ Not expecting a form selection right now.");
   }
 
   const form = deal.pendingForms[formIndex];
   if (!form) {
-    return ctx.answerCallbackQuery("❌ Invalid form selection.");
+    return safeAnswer(ctx, "❌ Invalid form selection.");
   }
 
-  await ctx.answerCallbackQuery(`✅ Form ${formIndex + 1} selected`);
+  await safeAnswer(ctx, `✅ Form ${formIndex + 1} selected`);
 
   const amount = amountFromForm(form);
   const sourceMsg = `ℹ️ Using Form ${formIndex + 1} for ${deal.groupTitle}: $${amount} (Buyer: ${form.buyer ?? '?'}, Seller: ${form.seller ?? '?'})`;
@@ -442,12 +456,12 @@ bot.callbackQuery(/^form:(\d+):(-?\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^paid:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const groupId = Number(ctx.match[1]);
   const deal = await getDeal(groupId);
 
-  await ctx.answerCallbackQuery("✅ Payment confirmed!");
+  await safeAnswer(ctx, "✅ Payment confirmed!");
 
   const confirmationMsg =
     deal?.finalAmount != null && deal?.finalNetwork
@@ -458,8 +472,6 @@ bot.callbackQuery(/^paid:(-?\d+)$/, async (ctx) => {
   await ctx.editMessageText(`✅ Payment confirmed for ${deal?.groupTitle ?? groupId}! Message sent to group.`);
   await setDealStep(groupId, 'done');
 
-  // Offer to lock the group down now that the deal's done, instead of
-  // leaving it open for anyone to keep posting in.
   await bot.api.sendMessage(ctx.from.id,
     `Deal wrapped up for *${deal?.groupTitle ?? groupId}* — lock the group now?`,
     {
@@ -471,10 +483,9 @@ bot.callbackQuery(/^paid:(-?\d+)$/, async (ctx) => {
   );
 });
 
-// ============ LOCK GC / SKIP ============
 bot.callbackQuery(/^lockgc:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const groupId = Number(ctx.match[1]);
 
@@ -496,10 +507,10 @@ bot.callbackQuery(/^lockgc:(-?\d+)$/, async (ctx) => {
       can_manage_topics: false,
     });
     await bot.api.sendMessage(groupId, "Deal completed. Lock the gc");
-    await ctx.answerCallbackQuery("🔒 Locked");
+    await safeAnswer(ctx, "🔒 Locked");
     await ctx.editMessageText("🔒 Group locked.");
   } catch (err) {
-    await ctx.answerCallbackQuery("❌ Failed to lock");
+    await safeAnswer(ctx, "❌ Failed to lock");
     await ctx.reply(
       "⚠️ Couldn't lock the group — the bot likely doesn't have \"Restrict members\" admin permission in that group. " +
       "Check the bot's admin rights in the group settings and try again."
@@ -509,20 +520,20 @@ bot.callbackQuery(/^lockgc:(-?\d+)$/, async (ctx) => {
 
 bot.callbackQuery(/^skipgc:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
-  await ctx.answerCallbackQuery("Skipped");
+  await safeAnswer(ctx, "Skipped");
   await ctx.editMessageText("⏭️ Skipped — group left open.");
 });
 
 bot.callbackQuery(/^notpaid:(-?\d+)$/, async (ctx) => {
   if (!ADMINS.includes(ctx.from.id)) {
-    return ctx.answerCallbackQuery("⛔ Not authorized!");
+    return safeAnswer(ctx, "⛔ Not authorized!");
   }
   const groupId = Number(ctx.match[1]);
   const deal = await getDeal(groupId);
 
-  await ctx.answerCallbackQuery("⏳");
+  await safeAnswer(ctx, "⏳");
   await bot.api.sendMessage(groupId, "⏳ Payment not received yet. Please wait.");
   await ctx.editMessageText(`⏳ Waiting for payment... (${deal?.groupTitle ?? groupId})`);
 
@@ -537,6 +548,10 @@ bot.callbackQuery(/^notpaid:(-?\d+)$/, async (ctx) => {
       }
     );
   }
+});
+
+bot.catch((err) => {
+  console.error("⚠️ Unhandled bot error (caught, process kept running):", err);
 });
 
 const PORT = process.env.PORT || 3000;
