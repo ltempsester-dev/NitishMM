@@ -333,10 +333,10 @@ async function finalizeDeal(
   const total = amount + fee;
 
   await bot.api.sendMessage(groupId,
-    ` *Wallet Address (${network}):*\n\`${address}\`\n\n` +
-    ` Amount: $${amount}\n` +
-    ` Fee (${FEE}%): $${fee.toFixed(2)}\n` +
-    ` Total: $${total.toFixed(2)}`,
+    `💰 *Wallet Address (${network}):*\n\`${address}\`\n\n` +
+    `💵 Amount: $${amount}\n` +
+    `📊 Fee (${FEE}%): $${fee.toFixed(2)}\n` +
+    `🔢 Total: $${total.toFixed(2)}`,
     { parse_mode: "Markdown" }
   );
 
@@ -457,6 +457,62 @@ bot.callbackQuery(/^paid:(-?\d+)$/, async (ctx) => {
   await bot.api.sendMessage(groupId, confirmationMsg);
   await ctx.editMessageText(`✅ Payment confirmed for ${deal?.groupTitle ?? groupId}! Message sent to group.`);
   await setDealStep(groupId, 'done');
+
+  // Offer to lock the group down now that the deal's done, instead of
+  // leaving it open for anyone to keep posting in.
+  await bot.api.sendMessage(ctx.from.id,
+    `Deal wrapped up for *${deal?.groupTitle ?? groupId}* — lock the group now?`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: new InlineKeyboard()
+        .text("🔒 Lock GC", `lockgc:${groupId}`)
+        .text("⏭️ Skip", `skipgc:${groupId}`)
+    }
+  );
+});
+
+// ============ LOCK GC / SKIP ============
+bot.callbackQuery(/^lockgc:(-?\d+)$/, async (ctx) => {
+  if (!ADMINS.includes(ctx.from.id)) {
+    return ctx.answerCallbackQuery("⛔ Not authorized!");
+  }
+  const groupId = Number(ctx.match[1]);
+
+  try {
+    await bot.api.setChatPermissions(groupId, {
+      can_send_messages: false,
+      can_send_audios: false,
+      can_send_documents: false,
+      can_send_photos: false,
+      can_send_videos: false,
+      can_send_video_notes: false,
+      can_send_voice_notes: false,
+      can_send_polls: false,
+      can_send_other_messages: false,
+      can_add_web_page_previews: false,
+      can_change_info: false,
+      can_invite_users: false,
+      can_pin_messages: false,
+      can_manage_topics: false,
+    });
+    await bot.api.sendMessage(groupId, "Deal completed. Lock the gc");
+    await ctx.answerCallbackQuery("🔒 Locked");
+    await ctx.editMessageText("🔒 Group locked.");
+  } catch (err) {
+    await ctx.answerCallbackQuery("❌ Failed to lock");
+    await ctx.reply(
+      "⚠️ Couldn't lock the group — the bot likely doesn't have \"Restrict members\" admin permission in that group. " +
+      "Check the bot's admin rights in the group settings and try again."
+    );
+  }
+});
+
+bot.callbackQuery(/^skipgc:(-?\d+)$/, async (ctx) => {
+  if (!ADMINS.includes(ctx.from.id)) {
+    return ctx.answerCallbackQuery("⛔ Not authorized!");
+  }
+  await ctx.answerCallbackQuery("Skipped");
+  await ctx.editMessageText("⏭️ Skipped — group left open.");
 });
 
 bot.callbackQuery(/^notpaid:(-?\d+)$/, async (ctx) => {
